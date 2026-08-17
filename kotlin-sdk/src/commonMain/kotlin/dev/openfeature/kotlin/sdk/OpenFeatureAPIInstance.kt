@@ -38,29 +38,16 @@ import kotlinx.coroutines.withContext
  */
 @Suppress("TooManyFunctions")
 open class OpenFeatureAPIInstance internal constructor() {
-    private data class ContextReconciliation(
-        val oldContext: EvaluationContext?,
-        val provider: FeatureProvider,
-        val providerGeneration: Long
-    )
-
     private var setProviderJob: Job? = null
     private var setEvaluationContextJob: Job? = null
     private var observeProviderEventsJob: Job? = null
 
     private val providerMutex = Mutex()
-    private val contextReconciliationMutex = Mutex()
     private val stateLock = SynchronizedObject()
     private val noOpProvider = NoOpProvider()
     private var provider: FeatureProvider = noOpProvider
     private var providerGeneration: Long = 0
     private var context: EvaluationContext? = null
-    private var contextReconciliationGeneration: Long? = null
-    private var activeContextReconciliations: Int = 0
-    private var contextReconciliationInitialStatus: OpenFeatureStatus? = null
-    private var contextReconciliationTerminalStatus: OpenFeatureStatus? = null
-    private var providerStatusGeneration: Long = 0
-    private var contextReconciliationTerminalProviderStatusGeneration: Long? = null
     val providersFlow: MutableStateFlow<FeatureProvider> = MutableStateFlow(noOpProvider)
 
     private val _statusFlow: MutableSharedFlow<OpenFeatureStatus> =
@@ -70,6 +57,8 @@ open class OpenFeatureAPIInstance internal constructor() {
             }
 
     val statusFlow: Flow<OpenFeatureStatus> get() = _statusFlow.distinctUntilChanged()
+
+    private val contextReconciler = ContextReconciler(::getStatus, _statusFlow::emit)
 
     var hooks: List<Hook<*>> = listOf()
         private set
@@ -240,35 +229,25 @@ open class OpenFeatureAPIInstance internal constructor() {
     }
 
     private suspend fun setEvaluationContextInternal(evaluationContext: EvaluationContext) {
-        var reconciliation: ContextReconciliation? = null
+        var reconciliation: ContextReconciler.Reconciliation? = null
         var terminalStatus: OpenFeatureStatus? = null
         try {
-            contextReconciliationMutex.withLock {
-                providerMutex.withLock {
-                    var shouldEmitReconciling = false
-                    synchronized(stateLock) {
-                        val oldContext = context
-                        context = evaluationContext
-                        if (provider !== noOpProvider) {
-                            reconciliation = ContextReconciliation(oldContext, provider, providerGeneration)
-                            if (contextReconciliationGeneration != providerGeneration) {
-                                contextReconciliationGeneration = providerGeneration
-                                activeContextReconciliations = 0
+            contextReconciler.begin(
+                capture = {
+                    providerMutex.withLock {
+                        synchronized(stateLock) {
+                            val oldContext = context
+                            context = evaluationContext
+                            if (provider !== noOpProvider) {
+                                ContextReconciler.Reconciliation(oldContext, provider, providerGeneration)
+                            } else {
+                                null
                             }
-                            if (activeContextReconciliations == 0) {
-                                contextReconciliationInitialStatus = getStatus()
-                                contextReconciliationTerminalStatus = null
-                                contextReconciliationTerminalProviderStatusGeneration = null
-                            }
-                            activeContextReconciliations++
-                            shouldEmitReconciling = activeContextReconciliations == 1
                         }
                     }
-                    if (shouldEmitReconciling) {
-                        _statusFlow.emit(OpenFeatureStatus.Reconciling)
-                    }
-                }
-            }
+                },
+                onRegistered = { reconciliation = it }
+            )
 
             val registeredReconciliation = reconciliation ?: return
             registeredReconciliation.provider.onContextSet(
@@ -288,49 +267,13 @@ open class OpenFeatureAPIInstance internal constructor() {
             val registeredReconciliation = reconciliation
             if (registeredReconciliation != null) {
                 withContext(NonCancellable) {
-                    completeContextReconciliation(
-                        registeredReconciliation.provider,
-                        registeredReconciliation.providerGeneration,
-                        terminalStatus
-                    )
-                }
-            }
-        }
-    }
-
-    private suspend fun completeContextReconciliation(
-        reconciliationProvider: FeatureProvider,
-        reconciliationProviderGeneration: Long,
-        terminalStatus: OpenFeatureStatus?
-    ) {
-        contextReconciliationMutex.withLock {
-            if (contextReconciliationGeneration != reconciliationProviderGeneration) return
-
-            if (terminalStatus != null) {
-                contextReconciliationTerminalStatus = terminalStatus
-                contextReconciliationTerminalProviderStatusGeneration = providerStatusGeneration
-            }
-            activeContextReconciliations--
-            if (activeContextReconciliations == 0) {
-                val retainedTerminalStatus = contextReconciliationTerminalStatus
-                val statusToEmit = retainedTerminalStatus ?: contextReconciliationInitialStatus
-                val shouldEmitStatus = if (retainedTerminalStatus != null) {
-                    contextReconciliationTerminalProviderStatusGeneration == providerStatusGeneration
-                } else {
-                    getStatus() is OpenFeatureStatus.Reconciling
-                }
-                contextReconciliationInitialStatus = null
-                contextReconciliationTerminalStatus = null
-                contextReconciliationTerminalProviderStatusGeneration = null
-
-                providerMutex.withLock {
-                    if (
-                        synchronized(stateLock) { provider === reconciliationProvider } &&
-                        providerGeneration == reconciliationProviderGeneration &&
-                        statusToEmit != null &&
-                        shouldEmitStatus
-                    ) {
-                        _statusFlow.emit(statusToEmit)
+                    contextReconciler.complete(registeredReconciliation, terminalStatus) {
+                        providerMutex.withLock {
+                            synchronized(stateLock) {
+                                provider === registeredReconciliation.provider &&
+                                    providerGeneration == registeredReconciliation.providerGeneration
+                            }
+                        }
                     }
                 }
             }
@@ -439,10 +382,7 @@ open class OpenFeatureAPIInstance internal constructor() {
     }
 
     private suspend fun emitProviderStatus(status: OpenFeatureStatus) {
-        contextReconciliationMutex.withLock {
-            providerStatusGeneration++
-            _statusFlow.emit(status)
-        }
+        contextReconciler.emitProviderStatus(status)
     }
 
     private suspend fun trackProviderBinding(provider: FeatureProvider) {
