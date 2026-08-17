@@ -33,8 +33,11 @@ internal class ContextReconciler(
     private val mutex = Mutex()
     private val state = State()
 
-    suspend fun begin(capture: suspend () -> Reconciliation?): Reconciliation? = mutex.withLock {
-        val reconciliation = capture() ?: return@withLock null
+    suspend fun begin(
+        capture: suspend () -> Reconciliation?,
+        onRegistered: (Reconciliation) -> Unit
+    ): Unit = mutex.withLock {
+        val reconciliation = capture() ?: return@withLock
         if (state.providerGeneration != reconciliation.providerGeneration) {
             state.providerGeneration = reconciliation.providerGeneration
             state.activeCount = 0
@@ -44,10 +47,11 @@ internal class ContextReconciler(
             state.terminalStatus = null
         }
         state.activeCount++
+        // Publish the token before emitting so cancellation can still complete the registration.
+        onRegistered(reconciliation)
         if (state.activeCount == 1) {
             emitStatus(OpenFeatureStatus.Reconciling)
         }
-        reconciliation
     }
 
     suspend fun complete(

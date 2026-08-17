@@ -145,6 +145,44 @@ class StatusTests {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
+    fun testCancellationDuringReconcilingEmissionDoesNotLeakReconciliation() = runTest {
+        val provider = SpyProvider()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val collectorStarted = Channel<Unit>(Channel.UNLIMITED)
+        val releaseCollector = Channel<Unit>(Channel.UNLIMITED)
+        val collector = launch {
+            var shouldBlock = true
+            OpenFeatureAPI.statusFlow.collect {
+                if (shouldBlock) {
+                    shouldBlock = false
+                    collectorStarted.send(Unit)
+                    releaseCollector.receive()
+                }
+            }
+        }
+        collectorStarted.receive()
+
+        repeat(3) {
+            OpenFeatureAPI.setProviderAndWait(provider, dispatcher = dispatcher)
+        }
+        OpenFeatureAPI.setEvaluationContext(ImmutableContext("cancelled"), dispatcher)
+        runCurrent()
+        assertTrue(provider.onContextSetCalls.isEmpty())
+
+        OpenFeatureAPI.setEvaluationContext(ImmutableContext("replacement"), dispatcher)
+        runCurrent()
+        assertTrue(provider.onContextSetCalls.isEmpty())
+
+        releaseCollector.send(Unit)
+        advanceUntilIdle()
+
+        assertEquals(1, provider.onContextSetCalls.size)
+        assertEquals(OpenFeatureStatus.Ready, OpenFeatureAPI.getStatus())
+        collector.cancelAndJoin()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
     fun testCancelledContextSetFinishingLastUsesReplacementStatus() = runTest {
         val provider = CancellationRaceProvider()
         val dispatcher = StandardTestDispatcher(testScheduler)

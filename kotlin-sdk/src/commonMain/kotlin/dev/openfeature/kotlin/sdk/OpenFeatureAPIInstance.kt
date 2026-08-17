@@ -232,19 +232,22 @@ open class OpenFeatureAPIInstance internal constructor() {
         var reconciliation: ContextReconciler.Reconciliation? = null
         var terminalStatus: OpenFeatureStatus? = null
         try {
-            reconciliation = contextReconciler.begin {
-                providerMutex.withLock {
-                    synchronized(stateLock) {
-                        val oldContext = context
-                        context = evaluationContext
-                        if (provider !== noOpProvider) {
-                            ContextReconciler.Reconciliation(oldContext, provider, providerGeneration)
-                        } else {
-                            null
+            contextReconciler.begin(
+                capture = {
+                    providerMutex.withLock {
+                        synchronized(stateLock) {
+                            val oldContext = context
+                            context = evaluationContext
+                            if (provider !== noOpProvider) {
+                                ContextReconciler.Reconciliation(oldContext, provider, providerGeneration)
+                            } else {
+                                null
+                            }
                         }
                     }
-                }
-            }
+                },
+                onRegistered = { reconciliation = it }
+            )
 
             val registeredReconciliation = reconciliation ?: return
             registeredReconciliation.provider.onContextSet(
